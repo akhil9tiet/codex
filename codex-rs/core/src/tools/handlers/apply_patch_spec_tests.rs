@@ -8,7 +8,7 @@ fn create_apply_patch_freeform_tool_matches_expected_spec() {
         ToolSpec::Freeform(FreeformTool {
             name: "apply_patch".to_string(),
             description:
-                "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON."
+                "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON. A path can be the target of only one file operation in a patch; put multiple edits to a file in one `*** Update File` block. Update hunks match the original file in forward file order; a later hunk cannot match a line inserted by an earlier hunk."
                     .to_string(),
             defer_loading: None,
             format: FreeformToolFormat {
