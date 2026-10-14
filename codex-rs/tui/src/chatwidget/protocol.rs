@@ -104,6 +104,15 @@ impl ChatWidget {
                     self.warning_display_state.startup_complete = true;
                     self.on_task_started();
                 }
+                // A replayed TurnStarted for an in-progress turn carries the
+                // turn's original start timestamp: restore the status timer
+                // origin so the elapsed indicator continues from the turn's
+                // start instead of restarting from zero.
+                if (from_replay || replay_kind.is_some())
+                    && notification.turn.status == TurnStatus::InProgress
+                {
+                    self.restore_status_timer_origin(notification.turn.started_at);
+                }
             }
             ServerNotification::TurnCompleted(notification) => {
                 self.restore_realtime_transcripts_before_turn(&notification.turn.id);
