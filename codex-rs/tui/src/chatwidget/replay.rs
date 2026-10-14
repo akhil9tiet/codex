@@ -146,6 +146,10 @@ impl ChatWidget {
                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
                 self.last_non_retry_error = None;
                 self.on_task_started();
+                // The turn carries its original start timestamp: restore the
+                // status timer origin so the elapsed indicator continues
+                // from the turn's start instead of restarting from zero.
+                self.restore_status_timer_origin(started_at);
             }
             let trailing_reasoning_id = (status == TurnStatus::InProgress)
                 .then(|| items.last())
