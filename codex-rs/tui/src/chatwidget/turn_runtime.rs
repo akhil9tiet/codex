@@ -93,6 +93,9 @@ impl ChatWidget {
         self.update_task_running_state();
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.reset_status_timer(Duration::ZERO);
+        // A genuinely new turn must not inherit a restored origin from a
+        // previously replayed turn: clear it so the indicator starts at zero.
+        self.bottom_pane.set_status_timer_origin(None);
         self.status_state.retry_status_header = None;
         self.clear_active_hook_cell();
         self.status_state.pending_status_indicator_restore = false;
@@ -112,6 +115,41 @@ impl ChatWidget {
             /*body*/ None,
         );
         self.request_redraw();
+    }
+
+    /// Restore the status timer origin for a replayed in-progress turn from
+    /// its original start timestamp.
+    ///
+    /// `on_task_started` resets the status timer to zero, which is correct
+    /// for a genuinely new live turn but discards the elapsed time of a turn
+    /// that started before this session resumed. Re-anchoring the display
+    /// origin to the turn's start keeps the elapsed indicator continuous
+    /// across reconnect/resume. A missing or future timestamp leaves the
+    /// zeroed timer untouched.
+    ///
+    /// `started_at_ms` is a Unix epoch timestamp in milliseconds, matching
+    /// the `duration_ms` / `started_at_ms` conventions in the app-server
+    /// protocol.
+    pub(super) fn restore_status_timer_origin(&mut self, started_at_ms: Option<i64>) {
+        let Some(started_at_ms) = started_at_ms else {
+            return;
+        };
+        let Ok(now) = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        else {
+            return;
+        };
+        let elapsed_ms = now
+            .as_millis()
+            .saturating_sub(u128::try_from(started_at_ms).unwrap_or(0));
+        let Ok(elapsed_ms) = u64::try_from(elapsed_ms) else {
+            return;
+        };
+        if let Some(origin) =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(elapsed_ms))
+        {
+            self.bottom_pane.set_status_timer_origin(Some(origin));
+        }
     }
 
     pub(super) fn on_task_complete(
