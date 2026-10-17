@@ -143,7 +143,7 @@ impl EventProcessorWithJsonOutput {
     fn map_item_with_id(
         item: ThreadItem,
         make_id: impl FnOnce() -> String,
-    ) -> Option<ExecThreadItem> {
+    ) -> Option<ExecThreadItem> { let unmapped_variant = serde_json::to_value(&item).ok().and_then(|v| v.get("type")?.as_str().map(str::to_owned));
         match item {
             ThreadItem::AgentMessage { text, .. } => Some(ExecThreadItem {
                 id: make_id(),
@@ -320,7 +320,7 @@ impl EventProcessorWithJsonOutput {
                     results: item.results,
                 }),
             }),
-            _ => None,
+            _ => unmapped_variant.map(|variant| ExecThreadItem { id: make_id(), details: ThreadItemDetails::Other(variant) }),
         }
     }
 
