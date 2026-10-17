@@ -295,11 +295,21 @@ class CodexClient:
             proc.wait(timeout=2)
         except Exception:
             proc.kill()
+            # Reap the process so a killed child does not linger as a zombie
+            # until the Popen object is garbage-collected.
+            proc.wait()
 
         if self._stderr_thread and self._stderr_thread.is_alive():
             self._stderr_thread.join(timeout=0.5)
         if self._reader_thread and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=0.5)
+
+        # Close the pipe file objects explicitly instead of leaving them to
+        # the garbage collector (avoids ResourceWarning: unclosed file).
+        if proc.stdout:
+            proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
 
     def initialize(self) -> InitializeResponse:
         self._runtime_version = None
