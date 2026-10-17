@@ -130,6 +130,10 @@ pub enum ThreadItemDetails {
     TodoList(TodoListItem),
     /// Describes a non-fatal error surfaced as an item.
     Error(ErrorItem),
+    /// Fallback for thread items with no dedicated exec representation.
+    /// Carries the protocol variant name (from its serde tag) so new
+    /// protocol variants surface here instead of being silently dropped.
+    Other(String),
 }
 
 /// Response from the agent.
