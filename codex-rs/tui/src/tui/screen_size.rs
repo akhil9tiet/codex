@@ -48,7 +48,9 @@ impl Tui {
                 self.screen_size.deferred_size.take().unwrap_or(cached)
             }
             TuiEvent::Key(_) | TuiEvent::Mouse(_) | TuiEvent::Paste(_) | TuiEvent::FocusLost => {
-                cached
+                let size = self.terminal.size()?;
+                self.terminal.resize(size)?; // keep last_known_screen_size in sync
+                size
             }
         };
         if matches!(event, TuiEvent::Resize(_) | TuiEvent::Resume)
