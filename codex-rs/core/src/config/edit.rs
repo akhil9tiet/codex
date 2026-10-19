@@ -649,6 +649,28 @@ impl ConfigDocument {
                         );
                     }
 
+                    // Expanding an inline table into a standard table renders a
+                    // `[header]` for it. The key's leaf-decor prefix (e.g. a
+                    // comment line above the pair) would otherwise be emitted
+                    // *inside* the header brackets, producing invalid TOML —
+                    // hoist it onto the new table so it renders above the
+                    // header instead.
+                    let hoisted_prefix = match current.get(segment.as_str()) {
+                        Some(TomlItem::Value(value))
+                            if value.as_inline_table().is_some() =>
+                        {
+                            current
+                                .key(segment.as_str())
+                                .and_then(|key| key.leaf_decor().prefix().cloned())
+                        }
+                        _ => None,
+                    };
+                    if hoisted_prefix.is_some()
+                        && let Some(mut key) = current.key_mut(segment.as_str())
+                    {
+                        key.leaf_decor_mut().clear();
+                    }
+
                     let item = current.get_mut(segment.as_str())?;
                     if is_structured_feature_path(&segments[..=index])
                         && let Some(enabled) = item.as_bool()
@@ -657,7 +679,11 @@ impl ConfigDocument {
                         feature.insert("enabled", value(enabled));
                         *item = TomlItem::Table(feature);
                     }
-                    current = document_helpers::ensure_table_for_write(item)?;
+                    let table = document_helpers::ensure_table_for_write(item)?;
+                    if let Some(prefix) = hoisted_prefix {
+                        table.decor_mut().set_prefix(prefix);
+                    }
+                    current = table;
                 }
                 TraversalMode::Existing => {
                     let item = current.get_mut(segment.as_str())?;
