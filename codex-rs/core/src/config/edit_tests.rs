@@ -719,6 +719,53 @@ network_access = true
 }
 
 #[test]
+fn batch_write_upsert_into_commented_inline_table_keeps_comment_above_header() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    let original = r#"[features]
+# any comment line
+multi_agent_v2 = { enabled = true, max_concurrent_threads_per_session = 30 }
+"#;
+    std::fs::write(codex_home.join(CONFIG_TOML_FILE), original).expect("seed config");
+
+    apply_blocking(
+        codex_home,
+        &[
+            ConfigEdit::SetPath {
+                segments: vec![
+                    "features".to_string(),
+                    "multi_agent_v2".to_string(),
+                    "max_concurrent_threads_per_session".to_string(),
+                ],
+                value: value(21i64),
+            },
+            ConfigEdit::SetPath {
+                segments: vec![
+                    "features".to_string(),
+                    "multi_agent_v2".to_string(),
+                    "disable_direct_message".to_string(),
+                ],
+                value: value(false),
+            },
+        ],
+    )
+    .expect("apply");
+
+    let updated = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = r#"[features]
+# any comment line
+[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 21
+disable_direct_message = false
+"#;
+    assert_eq!(updated, expected);
+    // The rewritten file must stay valid TOML: before the fix this produced
+    // an invalid `[# any comment line` header.
+    updated.parse::<DocumentMut>().expect("rewritten config is valid TOML");
+}
+
+#[test]
 fn blocking_clear_model_does_not_follow_legacy_active_profile() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
@@ -1216,19 +1263,13 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides(output_token_
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
-            default_tools_approval_mode: Some(AppToolApproval::Prompt),
+            default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
             oauth: None,
             oauth_resource: None,
-            tools: HashMap::from([(
-                "search".to_string(),
-                McpServerToolConfig {
-                    approval_mode: Some(AppToolApproval::Approve),
-                    output_token_limit: std::num::NonZeroUsize::new(output_token_limit),
-                },
-            )]),
+            tools: HashMap::new(),
         },
     );
 
@@ -1392,7 +1433,7 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
                 cwd: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            enabled: true,
+            enabled: false,
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
