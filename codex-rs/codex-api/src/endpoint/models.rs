@@ -5,13 +5,23 @@ use crate::provider::Provider;
 use bytes::Bytes;
 use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
+use codex_client::TransportError;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
 use http::Method;
+use http::StatusCode;
 use http::header::ETAG;
 use std::sync::Arc;
 use url::Url;
+
+/// A previously fetched model catalog, kept so an HTTP `304 Not Modified`
+/// response can reuse the cached body instead of re-downloading the catalog.
+#[derive(Debug, Clone)]
+pub struct CachedModelCatalog {
+    pub body: Vec<u8>,
+    pub etag: String,
+}
 
 pub struct ModelsClient<T: HttpTransport> {
     session: EndpointSession<T>,
@@ -67,14 +77,25 @@ impl<T: HttpTransport> ModelsClient<T> {
     }
 
     /// Fetches and decodes a catalog, optionally bounding response bytes before decoding.
+    ///
+    /// When `cached_catalog` is provided and the server answers `304 Not Modified`,
+    /// the cached catalog is decoded instead of returning an error.
+    ///
+    /// Returns the decoded models, the response ETag (if any), and the raw body.
     pub async fn list_models(
         &self,
         request_url: String,
         extra_headers: HeaderMap,
         response_body_limit_bytes: Option<usize>,
-    ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
+        cached_catalog: Option<CachedModelCatalog>,
+    ) -> Result<(Vec<ModelInfo>, Option<String>, Bytes), ApiError> {
         let (body, header_etag) = self
-            .list_models_raw(request_url, extra_headers, response_body_limit_bytes)
+            .list_models_raw(
+                request_url,
+                extra_headers,
+                response_body_limit_bytes,
+                cached_catalog,
+            )
             .await?;
         let ModelsResponse { models } =
             serde_json::from_slice::<ModelsResponse>(&body).map_err(|e| {
@@ -87,20 +108,24 @@ impl<T: HttpTransport> ModelsClient<T> {
                 ))
             })?;
 
-        Ok((models, header_etag))
+        Ok((models, header_etag, body))
     }
 
     /// Fetches a catalog using the provider's auth and retry policy without decoding it.
     ///
     /// Callers accepting provider-controlled catalogs must set a response-body limit
     /// and validate the native response without including raw values in diagnostics.
+    ///
+    /// When `cached_catalog` is provided and the server answers `304 Not Modified`,
+    /// the cached body and ETag are returned instead of an error.
     pub async fn list_models_raw(
         &self,
         request_url: String,
         extra_headers: HeaderMap,
         response_body_limit_bytes: Option<usize>,
+        cached_catalog: Option<CachedModelCatalog>,
     ) -> Result<(Bytes, Option<String>), ApiError> {
-        let resp = self
+        let resp = match self
             .session
             .execute_with(
                 Method::GET,
@@ -112,7 +137,18 @@ impl<T: HttpTransport> ModelsClient<T> {
                     req.response_body_limit_bytes = response_body_limit_bytes;
                 },
             )
-            .await?;
+            .await
+        {
+            Err(ApiError::Transport(error @ TransportError::Http { status, .. }))
+                if status == StatusCode::NOT_MODIFIED =>
+            {
+                match cached_catalog {
+                    Some(cached) => return Ok((Bytes::from(cached.body), Some(cached.etag))),
+                    None => return Err(ApiError::Transport(error)),
+                }
+            }
+            other => other?,
+        };
 
         let header_etag = resp
             .headers
@@ -137,6 +173,7 @@ mod tests {
     use codex_client::TransportError;
     use http::HeaderMap;
     use http::StatusCode;
+    use http::header::IF_NONE_MATCH;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::sync::Arc;
@@ -148,6 +185,7 @@ mod tests {
         last_request: Arc<Mutex<Option<Request>>>,
         body: Arc<ModelsResponse>,
         etag: Option<String>,
+        not_modified: bool,
     }
 
     impl Default for CapturingTransport {
@@ -156,13 +194,28 @@ mod tests {
                 last_request: Arc::new(Mutex::new(None)),
                 body: Arc::new(ModelsResponse { models: Vec::new() }),
                 etag: None,
+                not_modified: false,
             }
         }
     }
 
     impl HttpTransport for CapturingTransport {
         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+            let if_none_match = req
+                .headers
+                .get(IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
             *self.last_request.lock().unwrap() = Some(req);
+            if self.not_modified && if_none_match.is_some() && if_none_match == self.etag {
+                return Err(TransportError::Http {
+                    status: StatusCode::NOT_MODIFIED,
+                    url: None,
+                    headers: None,
+                    body: None,
+                    retry_after: None,
+                });
+            }
             let body = serde_json::to_vec(&*self.body).unwrap();
             let mut headers = HeaderMap::new();
             if let Some(etag) = &self.etag {
@@ -274,6 +327,7 @@ mod tests {
                 request_url.clone(),
                 HeaderMap::new(),
                 /*response_body_limit_bytes*/ Some(64),
+                /*cached_catalog*/ None,
             )
             .await
             .expect("limited request should succeed after auth retry");
@@ -285,11 +339,12 @@ mod tests {
             assert_eq!(request.headers[http::header::AUTHORIZATION], "Bearer test");
         }
 
-        let (models, _) = client
+        let (models, _, _) = client
             .list_models(
                 request_url,
                 HeaderMap::new(),
                 /*response_body_limit_bytes*/ None,
+                /*cached_catalog*/ None,
             )
             .await
             .expect("ordinary request on the same client should remain unbounded");
@@ -318,17 +373,19 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: None,
+            not_modified: false,
         };
 
         let provider = provider("https://example.com/api/codex");
         let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
         let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
 
-        let (models, _) = client
+        let (models, _, _) = client
             .list_models(
                 request_url,
                 HeaderMap::new(),
                 /*response_body_limit_bytes*/ None,
+                /*cached_catalog*/ None,
             )
             .await
             .expect("request should succeed");
@@ -381,17 +438,19 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: None,
+            not_modified: false,
         };
 
         let provider = provider("https://example.com/api/codex");
         let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
         let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
-        let (models, _) = client
+        let (models, _, _) = client
             .list_models(
                 request_url,
                 HeaderMap::new(),
                 /*response_body_limit_bytes*/ None,
+                /*cached_catalog*/ None,
             )
             .await
             .expect("request should succeed");
@@ -410,22 +469,73 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: Some("\"abc\"".to_string()),
+            not_modified: false,
         };
 
         let provider = provider("https://example.com/api/codex");
         let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
         let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
-        let (models, etag) = client
+        let (models, etag, _) = client
             .list_models(
                 request_url,
                 HeaderMap::new(),
                 /*response_body_limit_bytes*/ None,
+                /*cached_catalog*/ None,
             )
             .await
             .expect("request should succeed");
 
         assert_eq!(models.len(), 0);
         assert_eq!(etag, Some("\"abc\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_cached_catalog_on_not_modified() {
+        let etag = "\"cached-etag\"".to_string();
+        let cached_body = serde_json::to_vec(&ModelsResponse { models: Vec::new() }).unwrap();
+
+        let transport = CapturingTransport {
+            last_request: Arc::new(Mutex::new(None)),
+            body: Arc::new(ModelsResponse { models: Vec::new() }),
+            etag: Some(etag.clone()),
+            not_modified: true,
+        };
+
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
+        let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
+
+        let (models, response_etag, body) = client
+            .list_models(
+                request_url,
+                headers,
+                /*response_body_limit_bytes*/ None,
+                Some(CachedModelCatalog {
+                    body: cached_body.clone(),
+                    etag: etag.clone(),
+                }),
+            )
+            .await
+            .expect("304 should reuse the cached catalog");
+
+        assert_eq!(models.len(), 0);
+        assert_eq!(response_etag, Some(etag.clone()));
+        assert_eq!(body, Bytes::from(cached_body));
+
+        let sent_if_none_match = transport
+            .last_request
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .headers
+            .get(IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        assert_eq!(sent_if_none_match, Some(etag));
     }
 }
