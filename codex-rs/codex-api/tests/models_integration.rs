@@ -85,6 +85,7 @@ async fn invalid_models_response_reports_bounded_decode_metadata() {
                 request_url,
                 HeaderMap::new(),
                 /*response_body_limit_bytes*/ None,
+                /*cached_catalog*/ None,
             )
             .await
             .expect_err("invalid catalog should fail to decode");
@@ -190,11 +191,12 @@ async fn models_client_hits_models_endpoint() {
     let request_url = ModelsClient::<ReqwestTransport>::request_url(&provider, "0.1.0");
     let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
-    let (models, _) = client
+    let (models, _, _) = client
         .list_models(
             request_url,
             HeaderMap::new(),
             /*response_body_limit_bytes*/ None,
+            /*cached_catalog*/ None,
         )
         .await
         .expect("models request should succeed");
