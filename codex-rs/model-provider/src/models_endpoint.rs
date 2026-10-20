@@ -3,9 +3,11 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_api::AgentIdentityTelemetry;
+use codex_api::CachedModelCatalog;
 use codex_api::ModelsClient;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
@@ -46,6 +48,16 @@ const MODELS_ENDPOINT: &str = "/models";
 // Bound downloads from explicitly configured catalogs before decoding or caching them.
 const MAX_MODEL_CATALOG_BYTES: usize = 1024 * 1024;
 
+/// Last successfully fetched model catalog for one provider identity, kept in
+/// memory so catalog refreshes can revalidate with `If-None-Match` instead of
+/// re-downloading an unchanged catalog.
+#[derive(Debug, Clone)]
+struct CachedCatalog {
+    identity: String,
+    etag: String,
+    body: Vec<u8>,
+}
+
 /// Provider-owned OpenAI-compatible `/models` endpoint.
 #[derive(Debug)]
 pub(crate) struct OpenAiModelsEndpoint {
@@ -53,6 +65,7 @@ pub(crate) struct OpenAiModelsEndpoint {
     auth_manager: Option<Arc<AuthManager>>,
     gateway_auth_manager: Option<Result<Arc<GatewayAuthManager>, String>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
+    last_catalog: Mutex<Option<CachedCatalog>>,
 }
 
 impl OpenAiModelsEndpoint {
@@ -71,6 +84,7 @@ impl OpenAiModelsEndpoint {
             auth_manager,
             gateway_auth_manager,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder { redirect_policy }),
+            last_catalog: Mutex::new(None),
         }
     }
 
@@ -148,7 +162,18 @@ impl OpenAiModelsEndpoint {
             agent_identity_telemetry,
             auth_env: self.auth_env(),
         });
-        let (models, etag) = timeout(MODELS_REFRESH_TIMEOUT, async {
+        let cached_catalog = self.cached_catalog_for_identity(&identity);
+        let mut catalog_headers = HeaderMap::new();
+        if let Some(cached) = cached_catalog.as_ref()
+            && let Ok(if_none_match) = cached.etag.parse::<http::HeaderValue>()
+        {
+            catalog_headers.insert(http::header::IF_NONE_MATCH, if_none_match);
+        }
+        let cached_catalog = cached_catalog.map(|cached| CachedModelCatalog {
+            body: cached.body,
+            etag: cached.etag,
+        });
+        let (models, etag, catalog_body) = timeout(MODELS_REFRESH_TIMEOUT, async {
             let transport = self
                 .transport_builder
                 .build(http_client_factory, request_url.clone())
@@ -161,7 +186,12 @@ impl OpenAiModelsEndpoint {
                 .as_ref()
                 .map(|_| MAX_MODEL_CATALOG_BYTES);
             client
-                .list_models(request_url, HeaderMap::new(), response_body_limit_bytes)
+                .list_models(
+                    request_url,
+                    catalog_headers,
+                    response_body_limit_bytes,
+                    cached_catalog,
+                )
                 .await
                 .map_err(|mut error| {
                     if self.provider_info.model_catalog_url.is_some()
@@ -182,6 +212,9 @@ impl OpenAiModelsEndpoint {
         })
         .await
         .map_err(|_| CodexErr::RequestTimeout)??;
+        if let Some(etag) = etag.as_deref() {
+            self.remember_catalog(&identity, etag, catalog_body.to_vec());
+        }
         if self.provider_info.model_catalog_url.is_some() {
             let mut slugs = HashSet::new();
             if models
@@ -206,6 +239,24 @@ impl OpenAiModelsEndpoint {
             .as_ref()
             .is_some_and(|auth_manager| auth_manager.codex_api_key_env_enabled());
         collect_auth_env_telemetry(&self.provider_info, codex_api_key_env_enabled)
+    }
+
+    fn cached_catalog_for_identity(&self, identity: &str) -> Option<CachedCatalog> {
+        self.last_catalog
+            .lock()
+            .ok()
+            .and_then(|catalog| catalog.clone())
+            .filter(|cached| cached.identity == identity)
+    }
+
+    fn remember_catalog(&self, identity: &str, etag: &str, body: Vec<u8>) {
+        if let Ok(mut last_catalog) = self.last_catalog.lock() {
+            *last_catalog = Some(CachedCatalog {
+                identity: identity.to_string(),
+                etag: etag.to_string(),
+                body,
+            });
+        }
     }
 }
 
@@ -493,6 +544,7 @@ mod tests {
                 auth_manager: Some(auth.clone()),
                 gateway_auth_manager: None,
                 transport_builder: capture.clone(),
+                last_catalog: Mutex::new(None),
             });
             let manager = OpenAiModelsManager::new_without_cache(endpoint.clone(), Some(auth));
             manager.set_api_key_model_discovery_enabled(/*enabled*/ true);
@@ -533,6 +585,7 @@ mod tests {
                 auth_manager: auth_manager.clone(),
                 gateway_auth_manager: None,
                 transport_builder: capture.clone(),
+                last_catalog: Mutex::new(None),
             });
             let manager = OpenAiModelsManager::new_without_cache(endpoint, auth_manager);
             manager.set_api_key_model_discovery_enabled(/*enabled*/ true);
@@ -612,6 +665,7 @@ mod tests {
             transport_builder: Arc::new(RecordingTransportBuilder {
                 observed_request: Arc::clone(&observed_request),
             }),
+            last_catalog: Mutex::new(None),
         };
 
         endpoint
@@ -658,6 +712,7 @@ mod tests {
             transport_builder: Arc::new(RecordingTransportBuilder {
                 observed_request: Arc::new(Mutex::new(None)),
             }),
+            last_catalog: Mutex::new(None),
         };
 
         set_default_client_residency_requirement(Some(ResidencyRequirement::Us));
@@ -978,5 +1033,61 @@ mod tests {
         assert!(!error.to_string().contains("catalog-secret"));
         assert!(!format!("{error:?}").contains("catalog-secret"));
         assert_eq!(destination.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_revalidates_with_etag_and_reuses_catalog_on_not_modified() {
+        let server = MockServer::start().await;
+        let etag = "\"catalog-etag-1\"";
+        let catalog = ModelsResponse {
+            models: vec![model_info_from_slug("etag-model")],
+        };
+        Mock::given(method("GET"))
+            .and(path("/codex/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", etag)
+                    .set_body_json(&catalog),
+            )
+            .mount(&server)
+            .await;
+        let endpoint = Arc::new(OpenAiModelsEndpoint::new(
+            ModelProviderInfo {
+                model_catalog_url: Some(format!("{}/codex/models", server.uri()).into()),
+                ..ModelProviderInfo::default()
+            },
+            /*auth_manager*/ None,
+            /*gateway_auth_manager*/ None,
+        ));
+        let first = endpoint
+            .list_models(
+                "1.2.3",
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await
+            .expect("initial catalog fetch should succeed");
+        assert_eq!(first.etag.as_deref(), Some(etag));
+        assert_eq!(first.models.len(), 1);
+
+        // Serve 304 for the revalidation request carrying If-None-Match.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/codex/models"))
+            .and(header("if-none-match", etag))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let second = endpoint
+            .list_models(
+                "1.2.3",
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await
+            .expect("revalidation should reuse the cached catalog");
+        assert_eq!(second.models, first.models);
+        assert_eq!(second.etag.as_deref(), Some(etag));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
