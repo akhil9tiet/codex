@@ -11,6 +11,7 @@ mod session;
 pub use images::ImageRequestError;
 pub use images::ImagesClient;
 pub use memories::MemoriesClient;
+pub use models::CachedModelCatalog;
 pub use models::ModelsClient;
 pub use realtime_call::RealtimeCallClient;
 pub use realtime_call::RealtimeCallResponse;
