@@ -594,7 +594,30 @@ fn count_or_skipped(count: usize, complete: bool) -> String {
 }
 
 fn path_key(path: &Path) -> PathBuf {
-    normalize_for_path_comparison(path).unwrap_or_else(|_| path.to_path_buf())
+    let key = normalize_for_path_comparison(path).unwrap_or_else(|_| path.to_path_buf());
+    strip_verbatim_prefix(key)
+}
+
+/// Strip the Windows extended-length path prefix (`\\?\`) so that verbatim
+/// and regular spellings of the same path compare equal (ref #55536).
+/// Only the drive-letter form (`\\?\C:\...`) is stripped; UNC paths
+/// (`\\?\UNC\...`) are left untouched.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        const PREFIX: &str = r"\\?\";
+        if let Some(s) = path.to_str() {
+            if let Some(rest) = s.strip_prefix(PREFIX) {
+                let mut chars = rest.chars();
+                if let (Some(drive), Some(':'), Some(_)) = (chars.next(), chars.next(), chars.next()) {
+                    if drive.is_ascii_alphabetic() {
+                        return PathBuf::from(rest);
+                    }
+                }
+            }
+        }
+    }
+    path
 }
 
 fn rollout_path_key(path: &Path) -> PathBuf {
@@ -1216,13 +1239,13 @@ mod tests {
             .join("rollout-2025-01-02T10-00-01-00000000-0000-0000-0000-000000000002.jsonl");
         let invalid_utf8_path = home
             .path()
-            .join("rollout-2025-01-02T10-00-02-00000000-0000-0000-0000-000000000003.jsonl");
+            .join("rollout-2025-01-02T10-00-02-00000000-0000-0000-000000000003.jsonl");
         let unknown_history_mode_path = home
             .path()
             .join("rollout-2025-01-02T10-00-03-00000000-0000-0000-0000-000000000004.jsonl");
         let missing_path = home
             .path()
-            .join("rollout-2025-01-02T10-00-04-00000000-0000-0000-0000-000000000005.jsonl");
+            .join("rollout-2025-01-02T10-00-04-00000000-0000-0000-000000000005.jsonl");
         std::fs::write(&empty_path, " \n\t\n").expect("empty rollout");
         std::fs::write(&invalid_path, "not-json\n{also-invalid}\n").expect("invalid rollout");
         std::fs::write(&invalid_utf8_path, [0xff, 0xfe, b'\n']).expect("invalid utf8 rollout");
