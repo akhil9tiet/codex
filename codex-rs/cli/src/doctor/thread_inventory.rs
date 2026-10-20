@@ -1239,13 +1239,13 @@ mod tests {
             .join("rollout-2025-01-02T10-00-01-00000000-0000-0000-0000-000000000002.jsonl");
         let invalid_utf8_path = home
             .path()
-            .join("rollout-2025-01-02T10-00-02-00000000-0000-0000-000000000003.jsonl");
+            .join("rollout-2025-01-02T10-00-02-00000000-0000-0000-0000-000000000003.jsonl");
         let unknown_history_mode_path = home
             .path()
             .join("rollout-2025-01-02T10-00-03-00000000-0000-0000-0000-000000000004.jsonl");
         let missing_path = home
             .path()
-            .join("rollout-2025-01-02T10-00-04-00000000-0000-0000-000000000005.jsonl");
+            .join("rollout-2025-01-02T10-00-04-00000000-0000-0000-0000-000000000005.jsonl");
         std::fs::write(&empty_path, " \n\t\n").expect("empty rollout");
         std::fs::write(&invalid_path, "not-json\n{also-invalid}\n").expect("invalid rollout");
         std::fs::write(&invalid_utf8_path, [0xff, 0xfe, b'\n']).expect("invalid utf8 rollout");
@@ -1280,6 +1280,7 @@ mod tests {
                         "cli_version": "test",
                         "source": "cli",
                         "model_provider": "test-provider",
+                        "history_mode": "future",
                     },
                 })
             ),
