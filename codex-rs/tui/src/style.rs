@@ -64,7 +64,13 @@ pub fn user_message_style() -> Style {
 /// Submitted prompts use a lighter fill than the editable composer in either theme.
 pub(crate) fn history_prompt_style() -> Style {
     let Some(background) = default_bg() else {
-        return Style::default();
+        // Some terminals (e.g. tmux without OSC 11 support) do not answer the
+                // default-color probe. Keep the ANSI-safe DarkGray surface but set an
+                // explicit foreground so the prompt does not inherit an unreadable
+                // default (black text on dark gray on light terminals).
+                return Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White);
     };
     let (foreground, alpha) = if is_light(background) {
         ((0, 0, 0), 0.02)
